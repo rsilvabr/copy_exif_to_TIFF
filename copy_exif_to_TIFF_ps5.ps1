@@ -2,13 +2,32 @@
 $Workers           = 16
 $DryRun            = $false
 $SkipIfTiffHasExif = $true
+$SkipLzwAsCompressed = $false  # true = treat LZW as already compressed (skip ZIP re-compression)
+$SafeMode          = $true      # true = skip multi-page TIFFs (scanner IR, Photoshop layers)
+                                # false = compress all TIFFs including multi-page ones
+$IccPolicy         = "never"   # always | preserve_tiff | never (default: never — keep TIFF's original ICC)
 $CompressZip       = $true
 $OutputDir         = ""
 $StagingDir        = ""
 $Overwrite         = $true
 $AutoFind          = $true
 $FolderPattern     = "S5pro"
+$MagickTimeout     = 30        # seconds timeout for magick identify (prevents hang on corrupted files)
 # ──────────────────────────────────────────────────────────────────
+
+# ── Cleanup on interrupt ─────────────────────────────────────────
+$script:cleanupDirs = @()
+if ($StagingDir) { $script:cleanupDirs += $StagingDir }
+
+trap {
+    Write-Log "Interrupted! Cleaning up staging files..." "WARN"
+    foreach ($dir in $script:cleanupDirs) {
+        if (Test-Path -LiteralPath $dir) {
+            Remove-Item -Path "$dir\*" -Force -ErrorAction SilentlyContinue
+        }
+    }
+    break
+}
 
 # ── Logging ───────────────────────────────────────────────────────────
 $scriptName = "Copy-S5Pro-Exif"
@@ -29,16 +48,19 @@ $script:okTotal      = 0
 $script:skipTotal    = 0
 $script:missTotal    = 0
 $script:errTotal     = 0
+$script:multiTotal   = 0
+$script:multiPagePaths = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
 
 function Process-Results {
     param($lines)
     foreach ($line in $lines) {
         $script:counterTotal++
         $lvl = "INFO"
-        if     ($line -match '^OK')   { $script:okTotal++ }
-        elseif ($line -match '^SKIP') { $script:skipTotal++ }
-        elseif ($line -match '^MISS') { $script:missTotal++; $lvl = "WARN" }
-        elseif ($line -match '^ERROR') { $script:errTotal++;  $lvl = "ERROR" }
+        if     ($line -match '^OK')    { $script:okTotal++ }
+        elseif ($line -match '^SKIP')  { $script:skipTotal++ }
+        elseif ($line -match '^MISS')  { $script:missTotal++; $lvl = "WARN" }
+        elseif ($line -match '^ERROR')  { $script:errTotal++;  $lvl = "ERROR" }
+        elseif ($line -match '^MULTI')  { $script:multiTotal++; $lvl = "WARN" }
         Write-Log "[$($script:counterTotal)/$($script:total)] $line" $lvl
     }
 }
@@ -134,6 +156,10 @@ function Invoke-S5ProFolder {
             $writeDirL = $writeDir
             $finalDirL = $finalDir
             $overL     = $Overwrite
+            $skipLzwL  = $SkipLzwAsCompressed
+            $safeModeL = $SafeMode
+            $bagL      = $script:multiPagePaths
+            $iccPolicyL = $IccPolicy
 
             if (-not $p.Jpeg) {
                 "MISS | $($p.TifName) | no matching JPEG (base: $($p.TifBase))"
@@ -151,41 +177,94 @@ function Invoke-S5ProFolder {
                 continue
             }
 
-            exiftool -q -q -overwrite_original -P `
-                -tagsfromfile $p.Jpeg `
-                -EXIF:All -XMP:All -IPTC:All -ICC_Profile -unsafe `
-                $p.Tiff | Out-Null
+            if ($safeModeL) {
+                # Use a simple timeout mechanism for PS5
+                $magickJob = Start-Job { magick identify $args[0] 2>$null } -ArgumentList $p.Tiff
+                $completed = $magickJob | Wait-Job -Timeout $MagickTimeout
+                if (-not $completed) {
+                    Stop-Job $magickJob -ErrorAction SilentlyContinue
+                    Remove-Job $magickJob
+                    "ERROR (magick timeout) | $($p.TifName) | possibly corrupted"
+                    continue
+                }
+                $pageCount = ($magickJob | Receive-Job | Measure-Object -Line).Lines
+                Remove-Job $magickJob
+                if ($pageCount -gt 1) {
+                    $bagL.Add($p.Tiff) | Out-Null
+                    "MULTI ($pageCount IFDs — skipped) | $($p.TifName)"
+                    continue
+                }
+            }
+
+            # Check if TIFF already has ICC (fixed logic - don't reset $LASTEXITCODE)
+            $tiffHasIcc = $false
+            if ($iccPolicyL -eq "preserve_tiff" -or $iccPolicyL -eq "always") {
+                $iccCheck = exiftool -s -s -s -ICC_Profile:all $p.Tiff 2>$null
+                # Don't check $LASTEXITCODE here - just check if output exists
+                if ($iccCheck -and $iccCheck.Length -gt 0) { $tiffHasIcc = $true }
+            }
+            $copyIcc = ($iccPolicyL -eq "always") -or ($iccPolicyL -eq "preserve_tiff" -and -not $tiffHasIcc)
+            $iccTag = if ($copyIcc) { "-ICC_Profile" } else { "" }
+
+            $tagsArgs = @("-tagsfromfile", $p.Jpeg, "-EXIF:All", "-XMP:All", "-IPTC:All")
+            if ($iccTag) { $tagsArgs += $iccTag }
+            $tagsArgs += "-unsafe", $p.Tiff
+
+            exiftool -q -q -overwrite_original -P @tagsArgs | Out-Null
             if ($LASTEXITCODE -ne 0) { "ERROR (exiftool EXIF) | $($p.TifName)"; continue }
 
             if (-not $compressL) { "OK | $($p.TifName) <= $([IO.Path]::GetFileName($p.Jpeg))"; continue }
 
             $comp = exiftool -s -s -s -Compression $p.Tiff 2>$null
-            if ($comp -match 'Deflate|ZIP|LZW') { "OK+SKIP-ZIP ($comp) | $($p.TifName)"; continue }
+            if ($LASTEXITCODE -ne 0 -or -not $comp) {
+                "ERROR (exiftool check) | $($p.TifName) | cannot detect compression"
+                continue
+            }
+            if ($comp -match $(if ($skipLzwL) { 'Deflate|ZIP|LZW' } else { 'Deflate|ZIP' })) { "OK+SKIP-ZIP ($comp) | $($p.TifName)"; continue }
 
-            $writeDst = Join-Path $writeDirL $p.TifName
+            $stagingName = "$([guid]::NewGuid().ToString('N'))_$($p.TifName)"
+            $writeDst = Join-Path $writeDirL $stagingName
             $finalDst = Join-Path $finalDirL $p.TifName
 
             if ((Test-Path -LiteralPath $finalDst) -and -not $overL -and ($finalDst -ne $p.Tiff)) {
-                "OK+SKIP-ZIP (existe) | $($p.TifName)"; continue
+                "OK+SKIP-ZIP (exists) | $($p.TifName)"; continue
             }
 
             magick -quiet $p.Tiff -compress zip $writeDst 2>$null
             if ($LASTEXITCODE -ne 0) { "ERROR (magick ZIP) | $($p.TifName)"; continue }
 
             exiftool -q -q -overwrite_original -tagsfromfile $p.Tiff -all:all -unsafe $writeDst | Out-Null
+            
+            # Store staging mapping for later move
+            if ($stagingName) { $script:stagingMap[$p.TifName] = $stagingName }
+            
             "OK+ZIP | $($p.TifName) <= $([IO.Path]::GetFileName($p.Jpeg))"
         }
 
         foreach ($line in $results) { Process-Results @($line) }
 
+        # Move from staging to final destination (with integrity check and UUID mapping)
         if ($CompressZip -and $StagingDir -and -not $DryRun) {
             $moved = 0
             foreach ($tif in $groupFiles) {
-                $stagePath = Join-Path $StagingDir $tif.Name
-                $destPath  = Join-Path $finalDir   $tif.Name
+                # Use UUID-mapped staging name if available
+                $originalName = $tif.Name
+                if ($script:stagingMap.ContainsKey($originalName)) {
+                    $stagingName = $script:stagingMap[$originalName]
+                    $stagePath = Join-Path $StagingDir $stagingName
+                } else {
+                    $stagePath = Join-Path $StagingDir $originalName
+                }
+                $destPath  = Join-Path $finalDir   $originalName
                 if ((Test-Path -LiteralPath $stagePath) -and $stagePath -ne $destPath) {
+                    $stageSize = (Get-Item -LiteralPath $stagePath).Length
                     Move-Item -Force -LiteralPath $stagePath -Destination $destPath
-                    $moved++
+                    # Verify move succeeded
+                    if ((Test-Path -LiteralPath $destPath) -and ((Get-Item -LiteralPath $destPath).Length -eq $stageSize)) {
+                        $moved++
+                    } else {
+                        Write-Log "ERROR (move failed) | $originalName" "ERROR"
+                    }
                 }
             }
             if ($moved -gt 0) { Write-Log "  → Moved $moved file(s) → $finalDir" }
@@ -225,5 +304,13 @@ if ($AutoFind) {
 
 Write-Log ""
 Write-Log ("─" * 50)
-Write-Log "Done: $($script:okTotal) OK | $($script:skipTotal) skipped | $($script:missTotal) no JPEG pair | $($script:errTotal) errors | $($script:counterTotal)/$($script:total) processed"
+Write-Log "Done: $($script:okTotal) OK | $($script:skipTotal) skipped | $($script:missTotal) no JPEG pair | $($script:multiTotal) multi-page | $($script:errTotal) errors | $($script:counterTotal)/$($script:total) processed"
+
+if ($script:multiTotal -gt 0) {
+    Write-Log ""
+    Write-Log "── Multi-page TIFFs found (not touched):"
+    foreach ($p in ($script:multiPagePaths | Sort-Object)) {
+        Write-Log "   $p" "WARN"
+    }
+}
 Write-Log "Log: $logFile"

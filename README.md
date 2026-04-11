@@ -2,21 +2,45 @@
 
 Copies EXIF metadata from JPEG to the corresponding TIFF. 
 Optionally compresses the TIFF to ZIP/Deflate after copying.
-Useful to TIFFs exported by Fujifilm Hyper Utility (Fuji S5 Pro), since they usually have no metadata - the script can copy EXIF from the corresponding JPEGs in the same folder or in nearby folders following a pattern. 
+
+Originally created for Fujifilm S5 Pro and S3 Pro users who export TIFFs via Hyper Utility — 
+these TIFFs come without EXIF metadata. This script restores camera info, lens data, date/time, 
+and GPS by copying EXIF from the corresponding JPEG files.
 
 ---
 
 ## Why this exists
 
-The Fuji S5 Pro records images in RAF (Fuji RAW) format. Hyper Utility converts these to TIFF,
-but the resulting TIFF **does not inherit EXIF from the original** — camera model, lens, date,
-time, and GPS are all blank. The date on the TIFF is the export time, not the capture time.
+The Fuji S5 Pro and S3 Pro record images in RAF (Fuji RAW) format. The original Fujifilm 
+**Hyper Utility** software converts these to TIFF with excellent color rendering and the 
+signature 12MP Super CCD interpolation — but the resulting TIFF **does not inherit EXIF** 
+from the original RAF. Camera model, lens, date, time, and GPS are all blank.
 
-The JPEG exported by the camera with the RAW file (for RAW + JPEG shooting) has the EXIF metadata.
-This script uses the JPEG as the source and copies its EXIF to the corresponding TIFF.
+This script solves that by copying EXIF from the JPEG to the TIFF.
 
-For the case of no JPEG available (only RAW shooting), exporting JPEGs from the RAW files 
-using a modern software (CaptureOne, Lightroom, Darktable, etc) may work. Not tested.
+### Two workflows supported:
+
+**1. RAW + JPEG shooting (ideal)**
+- Camera saves both RAF + JPEG
+- JPEG has the EXIF metadata
+- Export TIFF from Hyper Utility
+- Run this script → TIFF now has EXIF from JPEG
+- Result: Fuji colors + good 12MP interpolation + complete metadata
+
+**2. RAW only shooting (also works)**
+- You only have RAF files from the camera
+- Export JPEG from any modern software (Capture One, Lightroom, Darktable, etc)
+- The JPEG will have EXIF (date/time from the RAW)
+- Export TIFF from Hyper Utility
+- Run this script → EXIF copied from "modern JPEG" to "Hyper Utility TIFF"
+- Result: Same benefits, even if you didn't shoot JPEG+RAW originally
+
+### Supported cameras
+
+- **Fuji S5 Pro** — Super CCD SR Pro, 12MP interpolated (2006)
+- **Fuji S3 Pro** — Super CCD SR, 12MP interpolated (2004)
+  - Note: S3 Pro can only shoot RAW **or** JPEG (not both simultaneously), 
+    so workflow #2 (export JPEG from modern software) is the way to go
 
 ---
 
@@ -104,16 +128,25 @@ _DSF0007_2.tif  →  looks for  _DSF0007.jpg
 ## Settings
 
 ```powershell
-$Workers           = 8        # parallel threads (PS7 only)
-$DryRun            = $false   # true = preview without modifying any files
-$SkipIfTiffHasExif = $true    # true = skip TIFFs that already have EXIF
-$CompressZip       = $false   # true = compress TIFF to ZIP after copying EXIF
-$OutputDir         = ""       # "" = overwrite in place | "zip" = subfolder | "F:\ZIPs" = absolute
-$StagingDir        = ""       # "" = disabled | "E:\staging" = write here, move after each group
-$Overwrite         = $false   # true = overwrite existing output files
-$AutoFind          = $false   # true = search subfolders for folders matching $FolderPattern
-$FolderPattern     = "S5pro"  # folder name pattern for AutoFind mode
+$Workers              = 8        # parallel threads (PS7 only)
+$DryRun               = $false   # true = preview without modifying any files
+$SkipIfTiffHasExif    = $true    # true = skip TIFFs that already have EXIF
+$SkipLzwAsCompressed  = $false   # true = treat LZW as already compressed (skip ZIP re-compression)
+$SafeMode             = $true    # true = skip multi-page TIFFs (scanner IR, Photoshop layers)
+$IccPolicy            = "never"  # always | preserve_tiff | never (default: never — keep TIFF's ICC)
+$CompressZip          = $false   # true = compress TIFF to ZIP after copying EXIF
+$OutputDir            = ""       # "" = overwrite in place | "zip" = subfolder | "F:\ZIPs" = absolute
+$StagingDir           = ""       # "" = disabled | "E:\staging" = write here, move after each group
+$Overwrite            = $false    # true = overwrite existing output files
+$AutoFind             = $false   # true = search subfolders for folders matching $FolderPattern
+$FolderPattern        = "S5pro"  # folder name pattern for AutoFind mode
 ```
+
+> **Why `$SkipLzwAsCompressed`?** LZW produces larger files on 16-bit TIFFs. Default (`$false`) converts LZW → ZIP. Set to `$true` if you want to keep LZW-compressed TIFFs as-is (treats them like ZIP/Deflate — skips re-compression).
+
+> **Why `$SafeMode`?** Multi-page TIFFs (scanner IR files, Photoshop layers) store data in multiple IFDs with byte-offset pointers that break when external tools recompress the file. `$SafeMode = $true` (default) detects these before touching them and skips them entirely. Multi-page TIFFs are listed at the end of the log for manual review.
+
+> **Why `$IccPolicy`?** When copying EXIF from JPEG to TIFF, the ICC profile can be copied too. Default (`"never"`) keeps the TIFF's original ICC — recommended when the TIFF is AdobeRGB and the JPEG is sRGB. `"always"` copies the JPEG's ICC regardless. `"preserve_tiff"` copies ICC from JPEG only if the TIFF has no ICC profile.
 
 ---
 
@@ -143,6 +176,8 @@ The two flags are independent — `$SkipIfTiffHasExif` only controls EXIF copyin
 | No | Yes | Copy EXIF → skip ZIP |
 | Yes | Yes | Skip everything |
 
+> `$SafeMode` adds another independent skip: if the TIFF has more than one IFD (multi-page), it is logged as `MULTI` and never touched, regardless of the flags above.
+
 ---
 
 ## Log
@@ -158,4 +193,5 @@ The two flags are independent — `$SkipIfTiffHasExif` only controls EXIF copyin
 | `OK+SKIP-ZIP` | EXIF copied, ZIP skipped (already compressed) |
 | `SKIP` | Skipped (already has EXIF, or output exists) |
 | `MISS` | No matching JPEG found |
+| `MULTI` | Multi-page TIFF skipped (SafeMode) |
 | `ERROR` | Failure — file was not processed |

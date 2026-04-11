@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile jxl_photo_v2.py)",
+      "Bash(python -m py_compile jxl_tiff_decoder_v2.py)",
+      "Bash(python -m py_compile jxl_tiff_encoder.py)",
+      "Bash(python -m py_compile jxl_jpeg_transcoder.py)",
+      "Bash(grep -rn \"^[[:space:]]*except:\" *.py)",
+      "Bash(python -c ':*)",
+      "Bash(python3:*)"
+    ]
+  }
+}
